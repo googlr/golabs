@@ -1,7 +1,8 @@
 package simplepb
 
 //
-// This is a outline of primary-backup replication based on a simplifed version of Viewstamp replication.
+// This is a outline of primary-backup replication 
+// 	based on a simplifed version of Viewstamp replication.
 //
 //
 //
@@ -10,13 +11,15 @@ import (
 	"sync"
 
 	"labrpc"
+
+	// "fmt"
 )
 
 // the 3 possible server status
 const (
-	NORMAL = iota
-	VIEWCHANGE
-	RECOVERING
+	NORMAL = iota // iota = 0
+	VIEWCHANGE // iota = 1
+	RECOVERING // iota = 2
 )
 
 // PBServer defines the state of a replica server (either primary or backup)
@@ -32,6 +35,7 @@ type PBServer struct {
 	commitIndex int           // all log entries <= commitIndex are considered to have been committed.
 
 	// ... other state that you might need ...
+	prepareRetry   int // number of prepare retries if no enough success recieved
 }
 
 // Prepare defines the arguments for the Prepare RPC
@@ -58,7 +62,8 @@ type RecoveryArgs struct {
 
 type RecoveryReply struct {
 	View          int           // the view of the primary
-	Entries       []interface{} // the primary's log including entries replicated up to and including the view.
+	// the primary's log including entries replicated up to and including the view.
+	Entries       []interface{} 
 	PrimaryCommit int           // the primary's commitIndex
 	Success       bool          // whether the Recovery request has been accepted or rejected
 }
@@ -141,12 +146,15 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 	srv.log = append(srv.log, v)
 
 	// Your other initialization code here, if there's any
+	srv.commitIndex = 0 // should already be initialized 
+	// prepareChan := make(chan int)
 	return srv
 }
 
 // Start() is invoked by tester on some replica server to replicate a
 // command.  Only the primary should process this request by appending
-// the command to its log and then return *immediately* (while the log is being replicated to backup servers).
+// the command to its log and then return *immediately* 
+//  (while the log is being replicated to backup servers).
 // if this server isn't the primary, returns false.
 // Note that since the function returns immediately, there is no guarantee that this command
 // will ever be committed upon return, since the primary
@@ -156,10 +164,10 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 // *if it's eventually committed*. The second return value is the current
 // view. The third return value is true if this server believes it is
 // the primary.
-func (srv *PBServer) Start(command interface{}) (
-	index int, view int, ok bool) {
+func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+
 	// do not process command if status is not NORMAL
 	// and if i am not the primary in the current view
 	if srv.status != NORMAL {
@@ -169,9 +177,99 @@ func (srv *PBServer) Start(command interface{}) (
 	}
 
 	// Your code here
+	// 	When Start(command) is invoked, 
+	// 	the primary should append the command in its log
+	// fmt.Printf("Primary: %d, view: %d, status: %d, index: %d, commitIndex: %d\n", 
+	// 	srv.me, srv.currentView, srv.status, len(srv.log), srv.commitIndex)
+	srv.lastNormalView = srv.currentView
 
-	return index, view, ok
+	srv.log = append(srv.log, command)
+	// 	and then send Prepare RPCs to other servers 
+	// to instruct them to replicate the command in the same index in their log.
+	args := &PrepareArgs {
+		View : srv.currentView,
+		PrimaryCommit : srv.commitIndex,
+		Index : len(srv.log) - 1,
+		Entry : command }
+	go srv.sendPrepareToPeers(args)
+
+	return len(srv.log) - 1, srv.currentView, true
+	// return index, view, ok
 }
+
+// func (srv *PBServer) increasePrimaryCommitIndex(confirmCommitChan chan int){
+// 	select {
+// 	case <- confirmCommitChan:
+// 		srv.mu.Lock()
+// 		defer srv.mu.Unlock()
+// 		srv.commitIndex ++
+// 		fmt.Printf("Commit: primary: %d, view: %d, status: %d, index: %d, commitIndex: %d\n", 
+// 			srv.me, srv.currentView, srv.status, len(srv.log), srv.commitIndex)
+// 	}
+// }
+
+// If the primary has received Success=true responses from a majority of servers (including 
+// itself), it considers the corresponding log index as "committed". (Since servers process 
+// Prepare messages), It advances thecommittedIndex field locally and also piggybacks this 
+// information to backup servers in subsequent Prepares.
+func (srv *PBServer) waitPrepareToCommit(
+	args *PrepareArgs, prepareReplyChan chan *PrepareReply, majorityResponseNumber int){
+
+	successResponseNumber := 0
+	totalResponseNumber := 0
+	for i := 0; i < len(srv.peers); i++ {
+		reply := <- prepareReplyChan
+		totalResponseNumber ++
+		if reply != nil && reply.Success == true {
+			successResponseNumber ++
+		}
+		if( successResponseNumber >= majorityResponseNumber ){
+			// wait till previous prepare is committed
+			for {
+				srv.mu.Lock()
+				if srv.commitIndex + 1 == args.Index {
+					srv.commitIndex = args.Index
+					// fmt.Printf("Commit: primary: %d, view: %d, status: %d, index: %d, commitIndex: %d\n", 
+					// 	srv.me, srv.currentView, srv.status, len(srv.log), srv.commitIndex)
+					srv.mu.Unlock()
+					break
+				}
+				srv.mu.Unlock()
+			}
+		}
+	}
+
+	// Not enough success prepare response recieved, resend prepare
+	go srv.sendPrepareToPeers(args)
+
+}
+
+func (srv *PBServer) sendPrepareToPeers(args *PrepareArgs) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	prepareReplyChan := make(chan *PrepareReply, len(srv.peers))
+	
+	for i := 0; i < len(srv.peers); i++ {
+		go func(server int) {
+			var reply PrepareReply
+			ok := srv.sendPrepare(server, args, &reply)
+			if ok {
+				prepareReplyChan <- &reply
+				// successResponseNumber += 1 // might cause problems if without sync ????????????
+				// fmt.Printf("Recieved server %d success\n", server)
+			} else {
+				prepareReplyChan <- nil
+				// fmt.Printf("Recieved server %d failed\n", server)
+			}
+		}(i)
+	}
+
+	majorityResponseNumber := len(srv.peers)/2 + 1	
+	go srv.waitPrepareToCommit(args, prepareReplyChan, majorityResponseNumber)
+	
+}
+
 
 // exmple code to send an AppendEntries RPC to a server.
 // server is the index of the target server in srv.peers[].
@@ -193,18 +291,139 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
 	return ok
 }
 
+// func (srv *PBServer) processPrepareMsg()
+
 // Prepare is the RPC handler for the Prepare RPC
 func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
 	// Your code here
+	// Upon receiving a Prepare RPC message, the backup checks whether the message's view 
+	// and its currentView match and whether the next entry to be added to the log is indeed 
+	// at the index specified in the message. If so, the backup adds the message's entry to the log 
+	// and replies Success=ok. Otherwise, the backup replies Success=false. 
+	
+	// Furthermore, if the backup's state falls behind the primary(e.g. its view is smaller 
+	// or its log is missing entries), it performs recovery to transfer the primary's log. 
+	// Note that the backup server needs to process Prepare messages according to their index order, 
+	// otherwise, it would end up unnecessarily rejecting many messages.
+	srv.mu.Lock()
+	// defer srv.mu.Unlock()	
+
+	// fmt.Printf("Prepare: node: %d, view: %d, status: %d, index: %d, commitIndex: %d\n", 
+	// 	srv.me, srv.currentView, srv.status, len(srv.log), srv.commitIndex)
+	// fmt.Printf("Recieved: pmView: %d, pmCommitIndex: %d, logIndex: %d\n", 
+	// 	args.View, args.PrimaryCommit, args.Index)
+
+	primaryView := args.View
+
+
+	if( srv.currentView == primaryView && len(srv.log) == args.Index ){
+		srv.prepareRetry = 0
+		srv.lastNormalView = srv.currentView
+
+		srv.log = append(srv.log, args.Entry)
+		reply.View, reply.Success = srv.currentView, true
+		srv.mu.Unlock()
+		return 
+	}
+
+	if( srv.currentView == primaryView && len(srv.log) > args.Index ){
+		// already processed this prepare, reconfirm without logging
+		// or srv is the primary
+		reply.View, reply.Success = srv.currentView, true
+		srv.mu.Unlock()
+		return 
+	}
+
+	if( srv.currentView > primaryView ){
+		reply.View, reply.Success = srv.currentView, false
+		srv.mu.Unlock()
+		return 
+	}
+
+	if( srv.prepareRetry >= 100 ){
+
+		//start recovering
+		srv.prepareRetry = 0
+		srv.status = RECOVERING
+
+		go func(view int) {
+			recoveryArgs := &RecoveryArgs { View: primaryView, Server: srv.me }
+			var recoveryReply RecoveryReply
+
+			ok := srv.sendRecovery( 
+				GetPrimary(view, len(srv.peers)), recoveryArgs, &recoveryReply)
+
+			if( ok == true && recoveryReply.Success == true ){
+				//recover the server's state
+				srv.mu.Lock()
+				srv.currentView = recoveryReply.View
+				srv.lastNormalView = srv.currentView
+				srv.log = recoveryReply.Entries
+				srv.commitIndex = recoveryReply.PrimaryCommit
+				srv.status = NORMAL
+				srv.mu.Unlock()
+			}
+
+		}(primaryView)
+
+		reply.View, reply.Success = srv.currentView, false
+		srv.mu.Unlock()
+		return 
+	} else {
+		srv.prepareRetry ++
+		srv.mu.Unlock()
+		srv.sendPrepare(srv.me, args, reply)
+	}
+
+	// if( srv.commitIndex < primaryCommit ){
+	// 	// update backup srv.commitIndex
+	// 	srv.commitIndex = primaryCommit // note here len(srv.log) >= primaryCommit >= srv.commitIndex
+	// }
+
+	// if( srv.currentView == primaryView ){
+
+	// 	// wait for the ( len(srv.log) + 1 )
+	// 	for len(srv.log) < logIndex {
+	// 		// len(srv.log) - 1 + 1 == logIndex 
+	// 	}
+
+	// 	// Process prepare
+	// 	if ( GetPrimary(srv.currentView, len(srv.peers)) == srv.me ) {
+	// 		// Primary recieve Prepare, return directly
+	// 		reply.View = srv.currentView
+	// 		reply.Success = true
+	// 		return
+	// 	} else { // Back up nodes, 
+	// 		srv.log = append(srv.log, logEntry)
+	// 		// srv.commitIndex ++ 		// should wait for the next prepare to update commitIndex
+	// 		reply.View = srv.currentView
+	// 		reply.Success = true
+	// 		return 
+	// 	}
+	// } else{
+	// 	fmt.Printf("Error in Prepare(), backup view > primaryView\n")
+	// }
+}
+
+func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *RecoveryReply) bool {
+	ok := srv.peers[server].Call("PBServer.Recovery", args, reply)
+	return ok
 }
 
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 	// Your code here
+	reply.View, reply.Entries, reply.PrimaryCommit = 
+		srv.currentView, srv.log, srv.commitIndex
+	if( srv.status == NORMAL ) {
+		 reply.Success = true
+	} else {
+		reply.Success = false
+	}
+	return
 }
 
-// Some external oracle prompts the primary of the newView to
-// switch to the newView.
+// Some external oracle prompts the primary of the newView to switch to the newView.
 // PromptViewChange just kicks start the view change protocol to move to the newView
 // It does not block waiting for the view change process to complete.
 func (srv *PBServer) PromptViewChange(newView int) {
@@ -226,7 +445,7 @@ func (srv *PBServer) PromptViewChange(newView int) {
 		go func(server int) {
 			var reply ViewChangeReply
 			ok := srv.peers[server].Call("PBServer.ViewChange", vcArgs, &reply)
-			// fmt.Printf("node-%d (nReplies %d) received reply ok=%v reply=%v\n", srv.me, nReplies, ok, r.reply)
+// fmt.Printf("node-%d (nReplies %d) received reply ok=%v reply=%v\n", srv.me, nReplies, ok, r.reply)
 			if ok {
 				vcReplyChan <- &reply
 			} else {
@@ -262,7 +481,7 @@ func (srv *PBServer) PromptViewChange(newView int) {
 		for i := 0; i < len(srv.peers); i++ {
 			var reply StartViewReply
 			go func(server int) {
-				// fmt.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
+// fmt.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
 				srv.peers[server].Call("PBServer.StartView", svArgs, &reply)
 			}(i)
 		}
@@ -273,18 +492,80 @@ func (srv *PBServer) PromptViewChange(newView int) {
 // the collection of replies for successful ViewChange requests.
 // if a quorum of successful replies exist, then ok is set to true.
 // otherwise, ok = false.
+
+// If the primary has received successful ViewChange replies from a majority of servers 
+// (including itself). It can proceed to start the new view. It needs to start the new-view 
+// with a log that contains all the committed entries of the previous view. To maintain 
+// this invariant, the primary chooses the log among the majority of successful replies 
+// using this rule: it picks the log whose lastest normal view number is the largest. If 
+// there are more than one such logs, it picks the longest log among those. 
 func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (
 	ok bool, newViewLog []interface{}) {
 	// Your code here
-	return ok, newViewLog
+	newMaxView := -1
+	var newMaxLog []interface{}
+
+	if( len(successReplies) < len(srv.peers)/2 + 1 ){
+		return false, newMaxLog
+	}
+
+	ok = false
+	for _ , r := range successReplies {
+		if( r.LastNormalView > newMaxView ){
+			newMaxView = r.LastNormalView
+			newMaxLog = r.Log
+			ok = true
+		} else if( r.LastNormalView == newMaxView ){
+			if( len(r.Log) > len(newMaxLog) ){
+				newMaxLog = r.Log
+			}
+		} else{
+			continue
+		}
+	}
+	return ok, newMaxLog
 }
 
 // ViewChange is the RPC handler to process ViewChange RPC.
+ // Upon receving ViewChange, a replica server checks that the view number included in 
+ // the message is indeed larger than what it thinks the current view number is. If 
+ // the check succeeds, it sets its current view number to that in the message and modifies 
+ // its status to VIEWCHANGE. It replies Success=true and includes its current log (in 
+ // its entirety) as well as the latest view-number that has been considered NORMAL. If the 
+ // check fails, the backup replies Success=false.
 func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
 	// Your code here
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if( srv.currentView < args.View && srv.status == NORMAL ){
+		srv.lastNormalView = srv.currentView
+		// srv.currentView = args.View
+		srv.status = VIEWCHANGE
+
+		reply.LastNormalView, reply.Log, reply.Success = srv.lastNormalView, srv.log, true
+	} else{
+		reply.LastNormalView, reply.Log, reply.Success = srv.lastNormalView, srv.log, false
+	}
 }
 
 // StartView is the RPC handler to process StartView RPC.
+
+// Once the primary has determined the log for the new-view, it sends out the StartView RPC 
+// to all servers to instruct them to start the new view. Upon receive StartView, a server 
+// sets the new-view as indicated in the message and changes its status to be NORMAL. Note 
+// that before setting the new-view according to the StartView RPC message, the server must 
+// again check that its current view is no bigger than that in the RPC message, which would 
+// mean that there's been no concurrent view-change for a larger view.
 func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
 	// Your code here
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if( srv.currentView <= args.View ){
+		srv.currentView = args.View
+		srv.status = NORMAL
+		srv.lastNormalView = srv.currentView
+		srv.log = args.Log
+		srv.commitIndex = len(srv.log) - 1
+	}
 }
