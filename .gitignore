@@ -4,3 +4,5 @@ api.key
 
 # MacOS
 .DS_Store
+
+*.patch
